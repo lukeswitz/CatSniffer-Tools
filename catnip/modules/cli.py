@@ -754,6 +754,80 @@ def sniff_airtag_scanner(device, putty):
         print_info(f"\nConnect to {dev.bridge_port} at 9600 baud to see the output.")
 
 
+@sniff.command(SniffingFirmware.JWORKS.name.lower())
+@click.option(
+    "--device",
+    "-d",
+    default=None,
+    type=int,
+    help="Device ID (for multiple CatSniffers)",
+)
+@click.option(
+    "--port",
+    "-p",
+    default=None,
+    type=str,
+    help="Serial port override (defaults to the device's bridge port)",
+)
+@click.option(
+    "--baud",
+    "-b",
+    default=115200,
+    type=int,
+    help="Serial baudrate (default: 115200)",
+)
+@click.option(
+    "--pcap",
+    default=None,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Write captured advertisements to this PCAP file (DLT_PPI)",
+)
+@click.option(
+    "--no-tui",
+    is_flag=True,
+    help="Stream raw serial lines instead of the live TUI",
+)
+def sniff_jworks(device, port, baud, pcap, no_tui):
+    """Sniffing JustWorks-vulnerable BLE devices."""
+    from . import justworks
+
+    flasher = Flasher()
+    dev = get_device_or_exit(device)
+
+    cat = Catnip(dev.bridge_port)
+
+    print_info("Checking for JustWorks scanner firmware...")
+
+    official_id = "justworks_scanner_cc1352p7"
+
+    if cat.check_firmware_by_metadata(official_id, dev.shell_port):
+        print_success("JustWorks scanner firmware found (via metadata)!")
+    else:
+        print_warning("JustWorks scanner firmware not found! - Flashing JustWorks scanner")
+
+        if not flasher.find_flash_firmware(official_id, dev):
+            print_error("Failed to flash JustWorks scanner firmware")
+            return
+
+        print_info("Waiting for device to initialize after flashing...")
+        time.sleep(1)
+
+        if cat.check_firmware_by_metadata(official_id, dev.shell_port):
+            print_success("JustWorks scanner firmware verified successfully!")
+        else:
+            print_warning("Firmware verification failed, but continuing...")
+
+    send_identify_command(dev)
+
+    target_port = port or dev.bridge_port
+    print_info(f"[{dev}] Starting JustWorks capture on {target_port} @ {baud}")
+    if pcap:
+        print_info(f"Writing PCAP to {pcap}")
+    print_info("Press Ctrl+C to stop.")
+
+    justworks.run(target_port, baud=baud, pcap=pcap, no_tui=no_tui)
+
+
 def send_identify_command(device):
     """Send identification command to device to help identify it visually."""
     import serial

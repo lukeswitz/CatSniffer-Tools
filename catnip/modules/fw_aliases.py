@@ -89,6 +89,8 @@ def get_official_id(alias_or_name: str) -> Optional[str]:
             return "airtag_spoofer_cc1352p7"
         if "scan" in name_lower:
             return "airtag_scanner_cc1352p7"
+    if "justworks" in name_lower:
+        return "justworks_scanner_cc1352p7"
 
     return None
 

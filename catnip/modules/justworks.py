@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""JustWorks BLE scanner — serial-to-TUI/PCAP capture for the justworks_scanner firmware.
+
+Parses `[SCAN] ADV`, `[CONN]`, and `[PAIR]` lines, maintains a live device table,
+and optionally writes advertisements to a Wireshark-compatible PCAP (DLT_PPI).
+"""
+
+__all__ = ["run"]
+
+import queue
+import re
+import struct
+import sys
+import time
+import threading
+from datetime import datetime
+
+import serial
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.text import Text
+from scapy.all import PcapWriter
+from scapy.packet import Raw
+
+ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+ADV_RE = re.compile(
+    r'\[SCAN\]\s+ADV\s+from\s+(0x[0-9A-Fa-f]+)'
+    r'(?:\s*\|\s*name:\(?([^|]*)\)?)?'
+    r'(?:\s*\|\s*RSSI:(-?\d+)\s*dBm)?'
+    r'(?:\s*\|\s*addrType:(\w+))?'
+    r'(?:\s*\|\s*primPHY:([\w]+))?'
+    r'(?:\s*\|\s*secPHY:(\S+))?'
+    r'(?:\s*\|\s*evt:([\w|]+))?'
+)
+
+CONN_RE = re.compile(
+    r'\[CONN\]\s+(\w.*?):\s+(0x[0-9A-Fa-f]+)'
+    r'(?:\s*\|\s*name:([^|]*))?'
+    r'(?:\s*\|\s*RSSI:(-?\d+))?'
+)
+
+PAIR_RE = re.compile(r'\[PAIR\]\s+(.*)')
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def format_mac(mac_hex: str) -> str:
+    h = mac_hex[2:] if mac_hex[:2] in ("0x", "0X") else mac_hex
+    h = h.zfill(12).upper()
+    return ":".join(h[i:i+2] for i in range(0, 12, 2))
+
+
+def safe_printable(s: str) -> str:
+    return "".join(c if (c.isprintable() and ord(c) < 128) else "?" for c in s)
+
+
+def parse_line(line: str) -> dict | None:
+    line = strip_ansi(line).strip()
+    if not line:
+        return None
+
+    m = ADV_RE.search(line)
+    if m:
+        mac, name, rssi, addr_type, prim_phy, sec_phy, evt_raw = m.groups()
+        name = (name or "").strip().strip(")").strip("(").strip()
+        if name.lower() == "no-name":
+            name = ""
+        evt_raw = (evt_raw or "").strip()
+        return {
+            "type":      "ADV",
+            "mac":       format_mac(mac),
+            "name":      name,
+            "rssi":      int(rssi) if rssi else -99,
+            "addr_type": addr_type or "?",
+            "prim_phy":  prim_phy or "?",
+            "sec_phy":   sec_phy or "?",
+            "events":    [e.strip() for e in evt_raw.split("|") if e.strip()],
+            "raw_evt":   evt_raw,
+            "ts":        time.time(),
+        }
+
+    m = CONN_RE.search(line)
+    if m:
+        action, mac, name, rssi = m.groups()
+        return {
+            "type":   "CONN",
+            "action": action.strip(),
+            "mac":    format_mac(mac),
+            "name":   (name or "").strip(),
+            "rssi":   int(rssi) if rssi else None,
+            "ts":     time.time(),
+        }
+
+    m = PAIR_RE.search(line)
+    if m:
+        return {
+            "type": "PAIR",
+            "msg":  m.group(1).strip(),
+            "ts":   time.time(),
+        }
+
+    return None
+
+
+def mac_str_to_bytes(mac_str: str) -> bytes:
+    h = mac_str.replace(":", "")
+    return bytes(reversed(int(h, 16).to_bytes(6, "big")))
+
+
+def pdu_type_from_events(events: list[str]) -> int:
+    evts = [e.upper() for e in events]
+    if "NONCONNECTABLE" in evts:
+        return 0x02
+    if "CONNECTABLE" in evts:
+        return 0x00
+    if "SCANNABLE" in evts:
+        return 0x06
+    return 0x00
+
+
+def build_ble_packet(entry: dict) -> bytes:
+    mac_bytes = mac_str_to_bytes(entry["mac"])
+    pdu_type = pdu_type_from_events(entry["events"])
+    tx_add = 1 if entry["addr_type"].upper() == "RANDOM" else 0
+    adv_payload = b""
+    if entry["name"]:
+        enc = entry["name"].encode("utf-8")[:29]
+        adv_payload = bytes([len(enc) + 1, 0x09]) + enc
+    pdu_len = 6 + len(adv_payload)
+    header = struct.pack("<BB", (tx_add << 6) | (pdu_type & 0x0F), pdu_len)
+    return b"\xD6\xBE\x89\x8E" + header + mac_bytes + adv_payload + b"\x00\x00\x00"
+
+
+def build_ppi_packet(ll_frame: bytes, rssi: int) -> bytes:
+    field = struct.pack("<HHiHH", 0xA002, 10, rssi, 2402, 0x0000)
+    header = struct.pack("<BBHI", 0, 0, 8 + len(field), 251)
+    return header + field + ll_frame
+
+
+class PcapCapture:
+    def __init__(self, path: str):
+        self._lock = threading.Lock()
+        self._writer = PcapWriter(path, linktype=192, sync=True)
+
+    def write(self, entry: dict):
+        ppi = build_ppi_packet(build_ble_packet(entry), entry["rssi"])
+        pkt = Raw(load=ppi)
+        pkt.time = entry["ts"]
+        with self._lock:
+            self._writer.write(pkt)
+
+    def close(self):
+        with self._lock:
+            self._writer.close()
+
+
+class State:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.devices: dict[str, dict] = {}
+        self.conn_log: list[dict] = []
+        self.pair_log: list[dict] = []
+        self.total_adv = 0
+        self.total_conn = 0
+
+    def update(self, entry: dict):
+        with self._lock:
+            t = entry["type"]
+            if t == "ADV":
+                mac = entry["mac"]
+                self.total_adv += 1
+                if mac not in self.devices:
+                    self.devices[mac] = {
+                        **entry,
+                        "count":    1,
+                        "rssi_min": entry["rssi"],
+                        "rssi_max": entry["rssi"],
+                        "conn":     False,
+                        "paired":   False,
+                    }
+                else:
+                    d = self.devices[mac]
+                    d["count"] += 1
+                    d["rssi"] = entry["rssi"]
+                    d["ts"] = entry["ts"]
+                    d["rssi_min"] = min(d["rssi_min"], entry["rssi"])
+                    d["rssi_max"] = max(d["rssi_max"], entry["rssi"])
+                    d["raw_evt"] = entry["raw_evt"]
+                    if entry["name"]:
+                        d["name"] = entry["name"]
+
+            elif t == "CONN":
+                self.total_conn += 1
+                self.conn_log.append(entry)
+                self.conn_log = self.conn_log[-50:]
+                mac = entry["mac"]
+                if mac in self.devices:
+                    self.devices[mac]["conn"] = "Connected" in entry["action"]
+                    if entry["name"]:
+                        self.devices[mac]["name"] = entry["name"]
+
+            elif t == "PAIR":
+                self.pair_log.append(entry)
+                self.pair_log = self.pair_log[-50:]
+
+    def snapshot(self) -> tuple[list, list, list]:
+        with self._lock:
+            devs = sorted(self.devices.values(), key=lambda x: x["rssi"], reverse=True)
+            return devs, list(self.conn_log[-8:]), list(self.pair_log[-4:])
+
+
+def rssi_bar(rssi: int) -> str:
+    filled = max(0, min(10, (rssi + 100) // 10))
+    return "[" + "#" * filled + "-" * (10 - filled) + "]"
+
+
+def rssi_style(rssi: int) -> str:
+    if rssi > -60:
+        return "bold green"
+    if rssi > -75:
+        return "yellow"
+    return "red"
+
+
+def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
+    devices, conn_log, pair_log = state.snapshot()
+    now = time.time()
+
+    dev_table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        border_style="bright_black",
+        expand=True,
+        padding=(0, 1),
+    )
+    dev_table.add_column("MAC", style="bold white", min_width=20, no_wrap=True)
+    dev_table.add_column("Name", style="yellow", min_width=18)
+    dev_table.add_column("RSSI", min_width=8, justify="right")
+    dev_table.add_column("Signal", min_width=12)
+    dev_table.add_column("Type", min_width=7)
+    dev_table.add_column("PHY", min_width=3)
+    dev_table.add_column("Events", min_width=20)
+    dev_table.add_column("C", min_width=1, justify="center")
+    dev_table.add_column("#", min_width=5, justify="right")
+    dev_table.add_column("Age", min_width=6, justify="right")
+
+    for d in devices:
+        age = now - d["ts"]
+        rs = rssi_style(d["rssi"])
+        conn_mark = Text("*", style="bold magenta") if d.get("conn") else Text("")
+        dev_table.add_row(
+            d["mac"],
+            d["name"] or Text("(no-name)", style="bright_black"),
+            Text(f"{d['rssi']} dBm", style=rs),
+            Text(rssi_bar(d["rssi"]), style=rs),
+            d["addr_type"],
+            d["prim_phy"],
+            d["raw_evt"][:20],
+            conn_mark,
+            str(d["count"]),
+            f"{age:.0f}s",
+        )
+
+    event_table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        border_style="bright_black",
+        expand=True,
+        padding=(0, 1),
+    )
+    event_table.add_column("Time", min_width=8, no_wrap=True)
+    event_table.add_column("Event", min_width=12)
+    event_table.add_column("MAC", min_width=20, no_wrap=True)
+    event_table.add_column("Detail", min_width=20)
+
+    for e in reversed(conn_log):
+        ts_str = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+        detail = e["name"] or ""
+        if e["rssi"]:
+            detail += f" {e['rssi']}dBm"
+        event_table.add_row(
+            ts_str,
+            Text(e["action"], style="magenta"),
+            e["mac"],
+            detail,
+        )
+    for e in reversed(pair_log):
+        ts_str = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+        event_table.add_row(
+            ts_str,
+            Text("PAIR", style="bold yellow"),
+            "",
+            safe_printable(e["msg"])[:40],
+        )
+
+    status = "  ".join(filter(None, [
+        f"[bold cyan]port:[/] {port}",
+        f"[bold cyan]devices:[/] {len(devices)}",
+        f"[bold cyan]adv:[/] {state.total_adv}",
+        f"[bold cyan]conn:[/] {state.total_conn}",
+        f"[bold cyan]pcap:[/] {pcap_path}" if pcap_path else None,
+        f"[bold cyan]{datetime.now().strftime('%H:%M:%S')}[/]",
+    ]))
+
+    layout = Layout()
+    layout.split_column(
+        Layout(
+            Panel(dev_table, title="BLE Devices", border_style="cyan"),
+            name="top",
+            ratio=3,
+        ),
+        Layout(
+            Panel(event_table, title="CONN / PAIR Events", border_style="magenta"),
+            name="bottom",
+            ratio=1,
+        ),
+        Layout(
+            Panel(status, border_style="bright_black"),
+            name="status",
+            size=3,
+        ),
+    )
+    return layout
+
+
+def serial_reader(
+    port: str,
+    baud: int,
+    state: State,
+    pcap: PcapCapture | None,
+    line_q: queue.Queue,
+    stop: threading.Event,
+):
+    try:
+        ser = serial.Serial(port, baud, timeout=1)
+        ser.reset_input_buffer()
+    except serial.SerialException as e:
+        line_q.put(f"[red]Failed to open {port}: {e}[/red]")
+        stop.set()
+        return
+
+    while not stop.is_set():
+        try:
+            raw = ser.readline()
+            if not raw:
+                continue
+            line = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
+            if not line:
+                continue
+            line_q.put(line)
+            entry = parse_line(line)
+            if entry:
+                state.update(entry)
+                if pcap and entry["type"] == "ADV":
+                    pcap.write(entry)
+        except serial.SerialException:
+            break
+        except Exception:
+            continue
+
+
+def run(port: str, baud: int = 115200, pcap: str | None = None, no_tui: bool = False) -> None:
+    """Run the JustWorks BLE capture on the given serial port.
+
+    Args:
+        port:    serial device path (e.g. /dev/cu.usbmodem*, COM3)
+        baud:    serial baudrate
+        pcap:    optional path to write captured ADVs as a PCAP (DLT_PPI)
+        no_tui:  if True, stream raw lines to the console instead of the live UI
+    """
+    if not port:
+        print("No serial port provided.")
+        sys.exit(1)
+
+    pcap_capture = PcapCapture(pcap) if pcap else None
+    state = State()
+    line_q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+
+    threading.Thread(
+        target=serial_reader,
+        args=(port, baud, state, pcap_capture, line_q, stop),
+        daemon=True,
+    ).start()
+
+    if no_tui:
+        console = Console()
+        console.print(f"[cyan]Listening on {port} @ {baud}[/cyan]")
+        try:
+            while True:
+                try:
+                    line = line_q.get(timeout=0.1)
+                    console.print(line)
+                except queue.Empty:
+                    pass
+        except KeyboardInterrupt:
+            pass
+    else:
+        console = Console()
+        try:
+            with Live(
+                console=console,
+                refresh_per_second=4,
+                screen=True,
+                redirect_stdout=False,
+                redirect_stderr=False,
+            ) as live:
+                while True:
+                    live.update(build_ui(state, pcap, port))
+                    time.sleep(0.25)
+        except KeyboardInterrupt:
+            pass
+
+    stop.set()
+    if pcap_capture:
+        pcap_capture.close()
+        print(f"\nPCAP saved to {pcap}")
+    print(f"Captured {state.total_adv} adv, {state.total_conn} connections from {len(state.devices)} devices.")
