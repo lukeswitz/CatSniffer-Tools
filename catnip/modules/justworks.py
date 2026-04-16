@@ -166,8 +166,10 @@ class State:
         self.devices: dict[str, dict] = {}
         self.conn_log: list[dict] = []
         self.pair_log: list[dict] = []
+        self.alerts: list[dict] = []  # sticky — never trimmed below 50
         self.total_adv = 0
         self.total_conn = 0
+        self.total_pair = 0
 
     def update(self, entry: dict):
         with self._lock:
@@ -204,20 +206,41 @@ class State:
                     self.devices[mac]["conn"] = "Connected" in entry["action"]
                     if entry["name"]:
                         self.devices[mac]["name"] = entry["name"]
+                if "Connected" in entry["action"]:
+                    self.alerts.append({**entry, "alert_type": "CONN"})
 
             elif t == "PAIR":
+                self.total_pair += 1
                 self.pair_log.append(entry)
                 self.pair_log = self.pair_log[-50:]
+                self.alerts.append({**entry, "alert_type": "PAIR"})
 
-    def snapshot(self) -> tuple[list, list, list]:
+    def snapshot(self) -> tuple[list, list, list, list]:
         with self._lock:
             devs = sorted(self.devices.values(), key=lambda x: x["rssi"], reverse=True)
-            return devs, list(self.conn_log[-8:]), list(self.pair_log[-4:])
+            return devs, list(self.conn_log[-8:]), list(self.pair_log[-4:]), list(self.alerts)
 
 
 def rssi_bar(rssi: int) -> str:
     filled = max(0, min(10, (rssi + 100) // 10))
     return "[" + "#" * filled + "-" * (10 - filled) + "]"
+
+
+def activity_bar(age: float) -> Text:
+    FULL, EMPTY = "▰", "▱"
+    if age < 2:
+        segs, style = 5, "bold green"
+    elif age < 5:
+        segs, style = 4, "green"
+    elif age < 10:
+        segs, style = 3, "yellow"
+    elif age < 20:
+        segs, style = 2, "yellow"
+    elif age < 60:
+        segs, style = 1, "red"
+    else:
+        segs, style = 0, "bright_black"
+    return Text(FULL * segs + EMPTY * (5 - segs), style=style)
 
 
 def rssi_style(rssi: int) -> str:
@@ -229,7 +252,7 @@ def rssi_style(rssi: int) -> str:
 
 
 def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
-    devices, conn_log, pair_log = state.snapshot()
+    devices, conn_log, pair_log, alerts = state.snapshot()
     now = time.time()
 
     dev_table = Table(
@@ -245,7 +268,7 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
     dev_table.add_column("Signal", min_width=12)
     dev_table.add_column("Type", min_width=7)
     dev_table.add_column("PHY", min_width=3)
-    dev_table.add_column("Events", min_width=20)
+    dev_table.add_column("Activity", min_width=7)
     dev_table.add_column("C", min_width=1, justify="center")
     dev_table.add_column("#", min_width=5, justify="right")
     dev_table.add_column("Age", min_width=6, justify="right")
@@ -261,7 +284,7 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
             Text(rssi_bar(d["rssi"]), style=rs),
             d["addr_type"],
             d["prim_phy"],
-            d["raw_evt"][:20],
+            activity_bar(age),
             conn_mark,
             str(d["count"]),
             f"{age:.0f}s",
@@ -304,17 +327,53 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
         f"[bold cyan]devices:[/] {len(devices)}",
         f"[bold cyan]adv:[/] {state.total_adv}",
         f"[bold cyan]conn:[/] {state.total_conn}",
+        f"[bold yellow]pair:[/] {state.total_pair}" if state.total_pair else None,
         f"[bold cyan]pcap:[/] {pcap_path}" if pcap_path else None,
         f"[bold cyan]{datetime.now().strftime('%H:%M:%S')}[/]",
     ]))
 
-    layout = Layout()
-    layout.split_column(
+    sections = [
         Layout(
             Panel(dev_table, title="BLE Devices", border_style="cyan"),
             name="top",
             ratio=3,
         ),
+    ]
+
+    if alerts:
+        alert_table = Table(
+            show_header=True,
+            header_style="bold yellow",
+            border_style="bright_black",
+            expand=True,
+            padding=(0, 1),
+        )
+        alert_table.add_column("Time", min_width=8, no_wrap=True)
+        alert_table.add_column("Type", min_width=10)
+        alert_table.add_column("MAC / Detail", min_width=40)
+
+        for a in alerts:
+            ts_str = datetime.fromtimestamp(a["ts"]).strftime("%H:%M:%S")
+            if a["alert_type"] == "PAIR":
+                label = Text("PAIR", style="bold red")
+                detail = safe_printable(a.get("msg", ""))[:60]
+            else:
+                label = Text("CONNECTED", style="bold magenta")
+                name = a.get("name", "") or ""
+                rssi = f" {a['rssi']}dBm" if a.get("rssi") else ""
+                detail = f"{a['mac']}  {name}{rssi}".strip()
+            alert_table.add_row(ts_str, label, detail)
+
+        alert_height = min(len(alerts) + 3, 10)
+        sections.append(
+            Layout(
+                Panel(alert_table, title="PAIR Log", border_style="yellow"),
+                name="alerts",
+                size=alert_height,
+            )
+        )
+
+    sections += [
         Layout(
             Panel(event_table, title="CONN / PAIR Events", border_style="magenta"),
             name="bottom",
@@ -325,7 +384,10 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
             name="status",
             size=3,
         ),
-    )
+    ]
+
+    layout = Layout()
+    layout.split_column(*sections)
     return layout
 
 
