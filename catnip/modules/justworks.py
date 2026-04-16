@@ -9,10 +9,13 @@ __all__ = ["run"]
 
 import queue
 import re
+import select
 import struct
 import sys
+import termios
 import time
 import threading
+import tty
 from datetime import datetime
 
 import serial
@@ -160,16 +163,33 @@ class PcapCapture:
             self._writer.close()
 
 
+EVENTS_ROWS = 8
+DEVICES_ROWS = 15
+MAX_LOG = 50
+
+
 class State:
     def __init__(self):
         self._lock = threading.Lock()
         self.devices: dict[str, dict] = {}
         self.conn_log: list[dict] = []
         self.pair_log: list[dict] = []
-        self.alerts: list[dict] = []  # sticky — never trimmed below 50
         self.total_adv = 0
         self.total_conn = 0
         self.total_pair = 0
+        self.events_offset: int = 0
+        self.devices_offset: int = 0
+
+    def scroll_events(self, delta: int) -> None:
+        with self._lock:
+            total = len(self.conn_log) + len(self.pair_log)
+            max_off = max(0, total - EVENTS_ROWS)
+            self.events_offset = max(0, min(self.events_offset + delta, max_off))
+
+    def scroll_devices(self, delta: int) -> None:
+        with self._lock:
+            max_off = max(0, len(self.devices) - DEVICES_ROWS)
+            self.devices_offset = max(0, min(self.devices_offset + delta, max_off))
 
     def update(self, entry: dict):
         with self._lock:
@@ -200,25 +220,25 @@ class State:
             elif t == "CONN":
                 self.total_conn += 1
                 self.conn_log.append(entry)
-                self.conn_log = self.conn_log[-50:]
+                self.conn_log = self.conn_log[-MAX_LOG:]
                 mac = entry["mac"]
                 if mac in self.devices:
                     self.devices[mac]["conn"] = "Connected" in entry["action"]
                     if entry["name"]:
                         self.devices[mac]["name"] = entry["name"]
-                if "Connected" in entry["action"]:
-                    self.alerts.append({**entry, "alert_type": "CONN"})
-
             elif t == "PAIR":
                 self.total_pair += 1
                 self.pair_log.append(entry)
-                self.pair_log = self.pair_log[-50:]
-                self.alerts.append({**entry, "alert_type": "PAIR"})
+                self.pair_log = self.pair_log[-MAX_LOG:]
 
-    def snapshot(self) -> tuple[list, list, list, list]:
+    def snapshot(self) -> tuple[list, list, list]:
         with self._lock:
             devs = sorted(self.devices.values(), key=lambda x: x["rssi"], reverse=True)
-            return devs, list(self.conn_log[-8:]), list(self.pair_log[-4:]), list(self.alerts)
+            return devs, list(self.conn_log), list(self.pair_log)
+
+
+def _fmt_time(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
 def rssi_bar(rssi: int) -> str:
@@ -252,8 +272,14 @@ def rssi_style(rssi: int) -> str:
 
 
 def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
-    devices, conn_log, pair_log, alerts = state.snapshot()
+    devices, conn_log, pair_log = state.snapshot()
     now = time.time()
+
+    dev_off = state.devices_offset
+    visible_devs = devices[dev_off:dev_off + DEVICES_ROWS]
+    dev_scroll_hint = ""
+    if len(devices) > DEVICES_ROWS:
+        dev_scroll_hint = f"  [/]{dev_off + 1}-{min(dev_off + DEVICES_ROWS, len(devices))}/{len(devices)}  [ / ]"
 
     dev_table = Table(
         show_header=True,
@@ -273,7 +299,7 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
     dev_table.add_column("#", min_width=5, justify="right")
     dev_table.add_column("Age", min_width=6, justify="right")
 
-    for d in devices:
+    for d in visible_devs:
         age = now - d["ts"]
         rs = rssi_style(d["rssi"])
         conn_mark = Text("*", style="bold magenta") if d.get("conn") else Text("")
@@ -290,6 +316,23 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
             f"{age:.0f}s",
         )
 
+    all_events: list[tuple] = []
+    for e in reversed(conn_log):
+        detail = e["name"] or ""
+        if e["rssi"]:
+            detail += f" {e['rssi']}dBm"
+        all_events.append((_fmt_time(e["ts"]), Text(e["action"], style="magenta"), e["mac"], detail))
+    for e in reversed(pair_log):
+        all_events.append((_fmt_time(e["ts"]), Text("PAIR", style="bold yellow"), "", safe_printable(e["msg"])[:40]))
+
+    total_events = len(all_events)
+    off = state.events_offset
+    visible = all_events[off:off + EVENTS_ROWS]
+
+    scroll_hint = ""
+    if total_events > EVENTS_ROWS:
+        scroll_hint = f"  ↑/↓  {off + 1}-{min(off + EVENTS_ROWS, total_events)}/{total_events}"
+
     event_table = Table(
         show_header=True,
         header_style="bold magenta",
@@ -302,25 +345,8 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
     event_table.add_column("MAC", min_width=20, no_wrap=True)
     event_table.add_column("Detail", min_width=20)
 
-    for e in reversed(conn_log):
-        ts_str = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
-        detail = e["name"] or ""
-        if e["rssi"]:
-            detail += f" {e['rssi']}dBm"
-        event_table.add_row(
-            ts_str,
-            Text(e["action"], style="magenta"),
-            e["mac"],
-            detail,
-        )
-    for e in reversed(pair_log):
-        ts_str = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
-        event_table.add_row(
-            ts_str,
-            Text("PAIR", style="bold yellow"),
-            "",
-            safe_printable(e["msg"])[:40],
-        )
+    for row in visible:
+        event_table.add_row(*row)
 
     status = "  ".join(filter(None, [
         f"[bold cyan]port:[/] {port}",
@@ -334,48 +360,15 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
 
     sections = [
         Layout(
-            Panel(dev_table, title="BLE Devices", border_style="cyan"),
+            Panel(dev_table, title=f"BLE Devices{dev_scroll_hint}", border_style="cyan"),
             name="top",
             ratio=3,
         ),
     ]
 
-    if alerts:
-        alert_table = Table(
-            show_header=True,
-            header_style="bold yellow",
-            border_style="bright_black",
-            expand=True,
-            padding=(0, 1),
-        )
-        alert_table.add_column("Time", min_width=8, no_wrap=True)
-        alert_table.add_column("Type", min_width=10)
-        alert_table.add_column("MAC / Detail", min_width=40)
-
-        for a in alerts:
-            ts_str = datetime.fromtimestamp(a["ts"]).strftime("%H:%M:%S")
-            if a["alert_type"] == "PAIR":
-                label = Text("PAIR", style="bold red")
-                detail = safe_printable(a.get("msg", ""))[:60]
-            else:
-                label = Text("CONNECTED", style="bold magenta")
-                name = a.get("name", "") or ""
-                rssi = f" {a['rssi']}dBm" if a.get("rssi") else ""
-                detail = f"{a['mac']}  {name}{rssi}".strip()
-            alert_table.add_row(ts_str, label, detail)
-
-        alert_height = min(len(alerts) + 3, 10)
-        sections.append(
-            Layout(
-                Panel(alert_table, title="PAIR Log", border_style="yellow"),
-                name="alerts",
-                size=alert_height,
-            )
-        )
-
     sections += [
         Layout(
-            Panel(event_table, title="CONN / PAIR Events", border_style="magenta"),
+            Panel(event_table, title=f"CONN / PAIR Events{scroll_hint}", border_style="magenta"),
             name="bottom",
             ratio=1,
         ),
@@ -427,6 +420,35 @@ def serial_reader(
             continue
 
 
+def keyboard_reader(state: State, stop: threading.Event) -> None:
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while not stop.is_set():
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    seq = ""
+                    while select.select([sys.stdin], [], [], 0.05)[0]:
+                        c = sys.stdin.read(1)
+                        seq += c
+                        if c.isalpha() or c == "~":
+                            break
+                    if seq == "[A":
+                        state.scroll_events(-1)
+                    elif seq == "[B":
+                        state.scroll_events(1)
+                elif ch == "[":
+                    state.scroll_devices(-1)
+                elif ch == "]":
+                    state.scroll_devices(1)
+                elif ch in ("\x03", "q", "Q"):
+                    stop.set()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 def run(port: str, baud: int = 115200, pcap: str | None = None, no_tui: bool = False) -> None:
     """Run the JustWorks BLE capture on the given serial port.
 
@@ -465,6 +487,11 @@ def run(port: str, baud: int = 115200, pcap: str | None = None, no_tui: bool = F
             pass
     else:
         console = Console()
+        threading.Thread(
+            target=keyboard_reader,
+            args=(state, stop),
+            daemon=True,
+        ).start()
         try:
             with Live(
                 console=console,
@@ -473,7 +500,7 @@ def run(port: str, baud: int = 115200, pcap: str | None = None, no_tui: bool = F
                 redirect_stdout=False,
                 redirect_stderr=False,
             ) as live:
-                while True:
+                while not stop.is_set():
                     live.update(build_ui(state, pcap, port))
                     time.sleep(0.25)
         except KeyboardInterrupt:
