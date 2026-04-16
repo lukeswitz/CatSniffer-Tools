@@ -7,7 +7,9 @@ and optionally writes advertisements to a Wireshark-compatible PCAP (DLT_PPI).
 
 __all__ = ["run"]
 
+import os
 import queue
+import random
 import re
 import select
 import struct
@@ -27,6 +29,35 @@ from rich.layout import Layout
 from rich.text import Text
 from scapy.all import PcapWriter
 from scapy.packet import Raw
+
+_VERSION = "3.3.1.0"
+_COMPANY = "Electronic Cats — PWNLAB"
+
+_PHRASES = [
+    "BLE: Basically Leaking Everything.",
+    "BLE doesn't lie. People do.",
+    "Your fitness tracker has secrets.",
+    "Catching packets like mice.",
+    "Pairing is caring.",
+    "Who said curiosity killed the cat?",
+    "Not all heroes wear capes. Some carry antennas.",
+    "Legally (probably) sniffing since 2024.",
+    "Because plaintext is a lifestyle choice.",
+    "BLE: Basically Leaking Everything."
+]
+_PHRASE = random.choice(_PHRASES)
+
+_CAT = f"""\
+      :-:              :--       |
+      ++++=.        .=++++       |
+      =+++++===++===++++++       |
+      -++++++++++++++++++-       |
+ .:   =++---++++++++---++=   :.  |  JustWorks BLE Scanner
+ ::---+++.   -++++-   .+++---::  |  v{_VERSION}
+::1..:-++++:   ++++   :++++-::.::|  {_PHRASE}
+.:...:=++++++++++++++++++=:...:. |
+ :---.  -++++++++++++++-  .---:  |
+ ..        .:------:.        ..  |"""
 
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -179,6 +210,10 @@ class State:
         self.total_pair = 0
         self.events_offset: int = 0
         self.devices_offset: int = 0
+        self.privacy: bool = False
+
+    def toggle_privacy(self) -> None:
+        self.privacy = not self.privacy
 
     def scroll_events(self, delta: int) -> None:
         with self._lock:
@@ -271,8 +306,13 @@ def rssi_style(rssi: int) -> str:
     return "red"
 
 
+def _mask(s: str, privacy: bool, placeholder: str = "**:**:**:**:**:**") -> str:
+    return placeholder if privacy else s
+
+
 def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
     devices, conn_log, pair_log = state.snapshot()
+    privacy = state.privacy
     now = time.time()
 
     dev_off = state.devices_offset
@@ -304,8 +344,8 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
         rs = rssi_style(d["rssi"])
         conn_mark = Text("*", style="bold magenta") if d.get("conn") else Text("")
         dev_table.add_row(
-            d["mac"],
-            d["name"] or Text("(no-name)", style="bright_black"),
+            _mask(d["mac"], privacy),
+            "" if privacy else (d["name"] or Text("(no-name)", style="bright_black")),
             Text(f"{d['rssi']} dBm", style=rs),
             Text(rssi_bar(d["rssi"]), style=rs),
             d["addr_type"],
@@ -318,12 +358,13 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
 
     all_events: list[tuple] = []
     for e in reversed(conn_log):
-        detail = e["name"] or ""
-        if e["rssi"]:
+        detail = "" if privacy else (e["name"] or "")
+        if e["rssi"] and not privacy:
             detail += f" {e['rssi']}dBm"
-        all_events.append((_fmt_time(e["ts"]), Text(e["action"], style="magenta"), e["mac"], detail))
+        all_events.append((_fmt_time(e["ts"]), Text(e["action"], style="magenta"), _mask(e["mac"], privacy), detail))
     for e in reversed(pair_log):
-        all_events.append((_fmt_time(e["ts"]), Text("PAIR", style="bold yellow"), "", safe_printable(e["msg"])[:40]))
+        msg = "" if privacy else safe_printable(e["msg"])[:40]
+        all_events.append((_fmt_time(e["ts"]), Text("PAIR", style="bold yellow"), "", msg))
 
     total_events = len(all_events)
     off = state.events_offset
@@ -348,6 +389,7 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
     for row in visible:
         event_table.add_row(*row)
 
+    privacy_badge = "  [bold red]REDACTED[/bold red]" if privacy else ""
     status = "  ".join(filter(None, [
         f"[bold cyan]port:[/] {port}",
         f"[bold cyan]devices:[/] {len(devices)}",
@@ -356,9 +398,22 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
         f"[bold yellow]pair:[/] {state.total_pair}" if state.total_pair else None,
         f"[bold cyan]pcap:[/] {pcap_path}" if pcap_path else None,
         f"[bold cyan]{datetime.now().strftime('%H:%M:%S')}[/]",
-    ]))
+    ])) + privacy_badge
+
+    keymap = (
+        "[dim]↑/↓[/dim] scroll events  "
+        "[dim][ / ][/dim] scroll devices  "
+        "[dim]^P[/dim] privacy  "
+        "[dim]q[/dim] quit"
+    )
 
     sections = [
+        Layout(
+            Panel(f"[cyan bold]{_CAT}[/cyan bold]", title=f"[cyan]{_COMPANY}[/cyan]",
+                  border_style="cyan bold", title_align="left", padding=(0, 1)),
+            name="header",
+            size=12,
+        ),
         Layout(
             Panel(dev_table, title=f"BLE Devices{dev_scroll_hint}", border_style="cyan"),
             name="top",
@@ -375,6 +430,11 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
         Layout(
             Panel(status, border_style="bright_black"),
             name="status",
+            size=3,
+        ),
+        Layout(
+            Panel(keymap, border_style="bright_black"),
+            name="keymap",
             size=3,
         ),
     ]
@@ -420,33 +480,26 @@ def serial_reader(
             continue
 
 
-def keyboard_reader(state: State, stop: threading.Event) -> None:
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        while not stop.is_set():
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                ch = sys.stdin.read(1)
-                if ch == "\x1b":
-                    seq = ""
-                    while select.select([sys.stdin], [], [], 0.05)[0]:
-                        c = sys.stdin.read(1)
-                        seq += c
-                        if c.isalpha() or c == "~":
-                            break
-                    if seq == "[A":
-                        state.scroll_events(-1)
-                    elif seq == "[B":
-                        state.scroll_events(1)
-                elif ch == "[":
-                    state.scroll_devices(-1)
-                elif ch == "]":
-                    state.scroll_devices(1)
-                elif ch in ("\x03", "q", "Q"):
-                    stop.set()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+def _handle_key(ch: str, fd: int, state: State, stop: threading.Event) -> None:
+    if ch == "\x1b":
+        seq = ""
+        while select.select([fd], [], [], 0.05)[0]:
+            c = os.read(fd, 1).decode("utf-8", errors="replace")
+            seq += c
+            if c.isalpha() or c == "~":
+                break
+        if seq == "[A":
+            state.scroll_events(-1)
+        elif seq == "[B":
+            state.scroll_events(1)
+    elif ch == "[":
+        state.scroll_devices(-1)
+    elif ch == "]":
+        state.scroll_devices(1)
+    elif ch == "\x10":      # Ctrl+P
+        state.toggle_privacy()
+    elif ch in ("\x03", "q", "Q"):
+        stop.set()
 
 
 def run(port: str, baud: int = 115200, pcap: str | None = None, no_tui: bool = False) -> None:
@@ -487,12 +540,10 @@ def run(port: str, baud: int = 115200, pcap: str | None = None, no_tui: bool = F
             pass
     else:
         console = Console()
-        threading.Thread(
-            target=keyboard_reader,
-            args=(state, stop),
-            daemon=True,
-        ).start()
+        fd = sys.stdin.fileno()
+        old_term = termios.tcgetattr(fd)
         try:
+            tty.setcbreak(fd)
             with Live(
                 console=console,
                 refresh_per_second=4,
@@ -502,9 +553,18 @@ def run(port: str, baud: int = 115200, pcap: str | None = None, no_tui: bool = F
             ) as live:
                 while not stop.is_set():
                     live.update(build_ui(state, pcap, port))
-                    time.sleep(0.25)
+                    deadline = time.monotonic() + 0.25
+                    while time.monotonic() < deadline and not stop.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        if select.select([fd], [], [], remaining)[0]:
+                            ch = os.read(fd, 1).decode("utf-8", errors="replace")
+                            _handle_key(ch, fd, state, stop)
         except KeyboardInterrupt:
             pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
 
     stop.set()
     if pcap_capture:
