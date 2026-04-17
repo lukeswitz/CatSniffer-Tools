@@ -276,9 +276,15 @@ def _fmt_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
-def rssi_bar(rssi: int) -> str:
+def rssi_bar(rssi: int) -> Text:
     filled = max(0, min(10, (rssi + 100) // 10))
-    return "[" + "#" * filled + "-" * (10 - filled) + "]"
+    if rssi > -60:
+        style = "bold green"
+    elif rssi > -75:
+        style = "yellow"
+    else:
+        style = "red"
+    return Text("▰" * filled + "▱" * (10 - filled), style=style)
 
 
 def activity_bar(age: float) -> Text:
@@ -319,7 +325,7 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
     visible_devs = devices[dev_off:dev_off + DEVICES_ROWS]
     dev_scroll_hint = ""
     if len(devices) > DEVICES_ROWS:
-        dev_scroll_hint = f"  [/]{dev_off + 1}-{min(dev_off + DEVICES_ROWS, len(devices))}/{len(devices)}  [ / ]"
+        dev_scroll_hint = f"  {dev_off + 1}-{min(dev_off + DEVICES_ROWS, len(devices))}/{len(devices)}  [ / ]"
 
     dev_table = Table(
         show_header=True,
@@ -347,7 +353,7 @@ def build_ui(state: State, pcap_path: str | None, port: str) -> Layout:
             _mask(d["mac"], privacy),
             "" if privacy else (d["name"] or Text("(no-name)", style="bright_black")),
             Text(f"{d['rssi']} dBm", style=rs),
-            Text(rssi_bar(d["rssi"]), style=rs),
+            rssi_bar(d["rssi"]),
             d["addr_type"],
             d["prim_phy"],
             activity_bar(age),
